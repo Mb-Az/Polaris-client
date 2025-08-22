@@ -19,6 +19,7 @@ import androidx.core.net.toUri
 import com.google.common.base.Converter
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.util.concurrent.atomic.AtomicLong
 
 class TestManager(private val context: Context) {
 
@@ -44,7 +45,7 @@ class TestManager(private val context: Context) {
         if(configurationManager.getWebIncluded())
             webTest = webTest(configurationManager.getWebTestUrl())
         if(configurationManager.getSMSIncluded())
-            smsTest = smsTest(ConfigurationManager.getSMSPhoneNumber(), ConfigurationManager.getSMSText())
+            smsTest = smsTest(context, configurationManager.getSMSPhoneNumber(), ConfigurationManager.getSMSText() + configurationManager.getTestInterval())
 
         return TestResult(
             ping = pingTest,
@@ -75,8 +76,16 @@ class TestManager(private val context: Context) {
             connection.disconnect()
 
             val endTime = System.currentTimeMillis()
-            val duration = (endTime - startTime).toDouble()
-            return if (duration > 0) ((bytesRead / duration) * 1000).toLong() else 0L
+            val duration = endTime - startTime
+
+            return if (duration > 0) {
+                // Calculate rate in KB/s
+                // (bytes / 1024) / (milliseconds / 1000)
+                // which simplifies to (bytes * 1000) / (milliseconds * 1024)
+                ((bytesRead.toDouble() * 1000.0) / (duration.toDouble() * 1024.0)).toLong()
+            } else {
+                0L
+            }
         } catch (e: Exception) {
             e.printStackTrace()
             return -1L
@@ -179,60 +188,76 @@ class TestManager(private val context: Context) {
         }
     }
 
-    public fun smsTest(phoneNumber: String, message: String): Long {
+    fun smsTest(context: Context, phoneNumber: String?, message: String): Long {
+        // Check for a valid phone number as a prerequisite
+        if (phoneNumber.isNullOrBlank()) {
+            return -1L
+        }
+
         val latch = CountDownLatch(1)
-        var deliveryTime: Long = -1
-        var startTime: Long = -1
+        val deliveryTime = AtomicLong(-1)
 
-        val smsManager = SmsManager.getDefault()
+        // A unique action to avoid conflicts with other apps
+        val smsDeliveredAction = "com.yourapp.SMS_DELIVERED_ACTION_${System.currentTimeMillis()}"
 
-        // BroadcastReceiver to listen for the SMS delivery report
         val smsReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
-                if (intent?.action == SMS_DELIVERED_ACTION) {
-                    deliveryTime = System.currentTimeMillis()
+                // Check if the received action matches our unique action
+                if (intent?.action == smsDeliveredAction) {
+                    // Set the delivery timestamp and release the latch
+                    deliveryTime.set(System.currentTimeMillis())
                     latch.countDown()
                 }
             }
         }
 
         try {
-            // Create a PendingIntent to be triggered on delivery
-            val deliveryIntent = Intent(SMS_DELIVERED_ACTION).apply { data = "sms:$phoneNumber".toUri() }
+            // Create a unique PendingIntent to be triggered on delivery
+            val deliveryIntent = Intent(smsDeliveredAction)
             val deliveryPendingIntent = PendingIntent.getBroadcast(
-                context, 0, deliveryIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                context,
+                0,
+                deliveryIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE // FLAG_IMMUTABLE is correct for modern Android
             )
 
-            // Register the receiver with the required flags
+            // Register the receiver with the unique action
             ContextCompat.registerReceiver(
                 context,
                 smsReceiver,
-                IntentFilter(SMS_DELIVERED_ACTION),
-                ContextCompat.RECEIVER_NOT_EXPORTED
+                IntentFilter(smsDeliveredAction),
+                ContextCompat.RECEIVER_NOT_EXPORTED // Securely register the receiver
             )
 
             // Start time measurement and send the SMS
-            startTime = System.currentTimeMillis()
-            smsManager.sendTextMessage(phoneNumber, null, message, null, deliveryPendingIntent)
+            val startTime = System.currentTimeMillis()
+            SmsManager.getDefault().sendTextMessage(
+                phoneNumber,
+                null,
+                message,
+                null, // This is for sent report; we don't need it for this test
+                deliveryPendingIntent
+            )
 
             // Wait for the delivery report with a timeout
             val delivered = latch.await(TIMEOUT_MS.toLong(), TimeUnit.MILLISECONDS)
 
             return if (delivered) {
-                deliveryTime - startTime
+                deliveryTime.get() - startTime
             } else {
-                -1L // Timeout occurred
+                -1L // Timeout occurred because the broadcast was not received
             }
 
         } catch (e: Exception) {
+            // Handle exceptions gracefully
             e.printStackTrace()
             return -1L
         } finally {
             try {
-                // Unregister the receiver to prevent a memory leak
+                // Always unregister the receiver to prevent a memory leak
                 context.unregisterReceiver(smsReceiver)
             } catch (e: Exception) {
-                // Ignore if the receiver was never registered
+                // Ignore if the receiver was never registered, as this can happen in some error states
             }
         }
     }

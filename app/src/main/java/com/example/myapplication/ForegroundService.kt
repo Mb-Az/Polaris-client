@@ -1,4 +1,5 @@
 package com.example.myapplication
+
 import CellInfoCollector
 import CellInfoDatabaseHelper
 import TestManager
@@ -14,11 +15,23 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
-import androidx.annotation.RequiresPermission
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
-import com.google.android.gms.location.*
-import kotlinx.coroutines.*
+import androidx.localbroadcastmanager.content.LocalBroadcastManager
+import com.google.android.gms.location.FusedLocationProviderClient
+import com.google.android.gms.location.LocationCallback
+import com.google.android.gms.location.LocationRequest
+import com.google.android.gms.location.LocationResult
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import org.json.JSONArray
 import org.json.JSONObject
@@ -28,13 +41,20 @@ import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.Timer
-import java.util.TimerTask
 
 private const val NOTIFICATION_CHANNEL_ID = "location_monitoring_channel"
 private const val NOTIFICATION_ID = 1
 
 class ForegroundService : Service() {
+
+    // Define actions for communication with MainActivity
+    companion object {
+        const val ACTION_STOP_SERVICE = "com.example.myapplication.ACTION_STOP_SERVICE"
+        const val ACTION_UPDATE_UI = "com.example.myapplication.ACTION_UPDATE_UI"
+    }
+
+    // Coroutine scope for the service lifecycle, using SupervisorJob for fault tolerance
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     private lateinit var fusedLocationClient: FusedLocationProviderClient
     private lateinit var locationRequest: LocationRequest
@@ -45,13 +65,16 @@ class ForegroundService : Service() {
     private lateinit var testManager: TestManager
     private lateinit var sessionManager: SessionManager
 
-    private var pollingTimer: Timer? = null
-    private var testTimer: Timer? = null
-    private var serverSyncTimer: Timer? = null
+    // Coroutine Jobs for each periodic routine
+    private var pollingJob: Job? = null
+    private var testJob: Job? = null
+    private var serverSyncJob: Job? = null
 
-    private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
-
-
+    // Status flags
+    private var pollingSuccess = false
+    private var serverSyncSuccess = false
+    private var cellMeasurementSuccess = false
+    private var testSuccess = false
 
     @SuppressLint("ForegroundServiceType")
     override fun onCreate() {
@@ -59,31 +82,36 @@ class ForegroundService : Service() {
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, createNotification())
 
-
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
         dbHelper = CellInfoDatabaseHelper(this)
         testDbHelper = TestResultDatabaseHelper(this)
         configurationManager = ConfigurationManager(this)
         testManager = TestManager(this)
         sessionManager = SessionManager(this)
+
+        // Attempt login on service creation
         serviceScope.launch {
             try {
                 sessionManager.login("user@example.com", "string")
+                // Broadcast initial configuration after login and setup
+                broadcastConfigurationUpdate()
             } catch (e: Exception) {
-                // Handle any login errors here
                 Log.e("ForegroundService", "Login failed", e)
             }
         }
-        // Moved location setup to onCreate to prevent redundant listeners.
-        setupAndStartLocationUpdates()
 
-        // Start all main routines as soon as the service is created.
+        // Setup location updates and start all main routines
+        setupAndStartLocationUpdates()
         startPollingRoutine()
         startTestRoutine()
         startServerSyncRoutine()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP_SERVICE) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
         return START_STICKY
     }
 
@@ -93,13 +121,13 @@ class ForegroundService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        // Ensure location updates are removed when the service is destroyed.
+        // Ensure all resources are cleaned up
         if (::locationCallback.isInitialized) {
             fusedLocationClient.removeLocationUpdates(locationCallback)
         }
-        pollingTimer?.cancel()
-        testTimer?.cancel()
-        serverSyncTimer?.cancel()
+        pollingJob?.cancel()
+        testJob?.cancel()
+        serverSyncJob?.cancel()
         serviceScope.cancel()
     }
 
@@ -123,172 +151,198 @@ class ForegroundService : Service() {
             .build()
     }
 
-    // New method to set up and start location updates.
+    @SuppressLint("MissingPermission")
     private fun setupAndStartLocationUpdates() {
-        locationRequest = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, configurationManager.getMeasurementInterval())
-            .setMinUpdateIntervalMillis(configurationManager.getMeasurementInterval())
+        locationRequest = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, configurationManager.getMeasurementInterval().toLong())
+            .setMinUpdateIntervalMillis(configurationManager.getMeasurementInterval().toLong())
             .build()
 
         locationCallback = object : LocationCallback() {
-            @RequiresPermission(Manifest.permission.ACCESS_FINE_LOCATION)
             override fun onLocationResult(result: LocationResult) {
                 val location = result.lastLocation ?: return
-                val cellInfoCollector = CellInfoCollector(applicationContext)
-                val cellInfo = cellInfoCollector.getCellInfo()
-                val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
+                try {
+                    val cellInfoCollector = CellInfoCollector(applicationContext)
+                    val cellInfo = cellInfoCollector.getCellInfo()
+                    val timestampFinal = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
 
-                serviceScope.launch {
-                    dbHelper.insertLocation(location.latitude, location.longitude, timestamp, cellInfo)
+                    serviceScope.launch {
+                        dbHelper.insertLocation(location.latitude, location.longitude, timestampFinal, cellInfo)
+                        cellMeasurementSuccess = true
+                        broadcastConfigurationUpdate()
+                    }
+                } catch (e: Exception) {
+                    Log.e("ForegroundService", "Error in cell measurement routine: ${e.message}")
+                    cellMeasurementSuccess = false
+                    broadcastConfigurationUpdate()
                 }
             }
         }
-
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
             fusedLocationClient.requestLocationUpdates(locationRequest, locationCallback, mainLooper)
         }
     }
 
+    /**
+     * Polling routine to check for configuration updates from the server.
+     * Cancels any existing job before starting a new one.
+     */
     private fun startPollingRoutine() {
-        pollingTimer?.cancel()
-        pollingTimer = Timer()
-        val oldPollingInterval = configurationManager.getPollingInterval()
-        val oldMeasurementInterval = configurationManager.getMeasurementInterval()
-        val oldTestMeasurementInterval = configurationManager.getTestInterval()
-        val oldServerSyncInterval = configurationManager.getServerSyncInterval()
+        pollingJob?.cancel()
+        pollingJob = serviceScope.launch {
+            while (isActive) {
+                val oldMeasurementInterval = configurationManager.getMeasurementInterval()
+                val oldTestInterval = configurationManager.getTestInterval()
+                val oldServerSyncInterval = configurationManager.getServerSyncInterval()
 
-        val pollingTask = object : TimerTask() {
-            override fun run() {
-                serviceScope.launch {
+                try {
                     configurationManager.fetchConfigurationFromServer()
-                    val newPollingInterval = configurationManager.getPollingInterval()
                     val newMeasurementInterval = configurationManager.getMeasurementInterval()
-                    val newTestMeasurementInterval = configurationManager.getTestInterval()
+                    val newTestInterval = configurationManager.getTestInterval()
                     val newServerSyncInterval = configurationManager.getServerSyncInterval()
 
-                    if (oldPollingInterval != newPollingInterval) {
-                        startPollingRoutine()
-                    }
+                    pollingSuccess = true
+                    // Broadcast the new configuration to the UI
+                    broadcastConfigurationUpdate()
+
                     if (oldMeasurementInterval != newMeasurementInterval) {
-                        // If the measurement interval changes, restart the location updates with the new settings.
                         fusedLocationClient.removeLocationUpdates(locationCallback)
                         setupAndStartLocationUpdates()
                     }
-                    if (oldTestMeasurementInterval != newTestMeasurementInterval) {
+                    if (oldTestInterval != newTestInterval) {
                         startTestRoutine()
                     }
                     if (oldServerSyncInterval != newServerSyncInterval) {
                         startServerSyncRoutine()
                     }
+                } catch (e: Exception) {
+                    Log.e("ForegroundService", "Error in polling routine: ${e.message}")
+                    pollingSuccess = false
+                    broadcastConfigurationUpdate()
                 }
+                delay(configurationManager.getPollingInterval().toLong())
             }
         }
-        pollingTimer?.schedule(pollingTask, 0, configurationManager.getPollingInterval())
-    }
-
-    // This routine is now redundant and can be removed.
-    // The single, active location listener handles the measurement interval.
-    // private fun startMeasurementRoutine() { ... }
-
-    private fun startTestRoutine() {
-        testTimer?.cancel()
-        testTimer = Timer()
-        val testTask = object : TimerTask() {
-            override fun run() {
-                serviceScope.launch(Dispatchers.IO){
-                    val location = try {
-                        @SuppressLint("MissingPermission")
-                        fusedLocationClient.lastLocation.await()
-                    } catch (e: Exception) {
-                        Log.e("LocationService", "Failed to get last known location for test: ${e.message}")
-                        null
-                    }
-                    val testResults = testManager.CollectTestResult(configurationManager)
-                    val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
-                    testDbHelper.insertTestResult(timestamp,location?.latitude, location?.longitude,testResults)
-                }
-            }
-        }
-        testTimer?.schedule(testTask, 0, configurationManager.getTestInterval())
     }
 
     /**
-     * Refactored server sync routine to retrieve and send all unsent data from both databases.
+     * Test routine to collect and save test results periodically.
+     * Cancels any existing job before starting a new one.
+     */
+    private fun startTestRoutine() {
+        testJob?.cancel()
+        testJob = serviceScope.launch {
+            while (isActive) {
+                try {
+                    @SuppressLint("MissingPermission")
+                    val location = fusedLocationClient.lastLocation.await()
+                    val testResults = testManager.CollectTestResult(configurationManager)
+                    val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
+
+                    if (testResults.hasFailedTests()) {
+                        testSuccess = false
+                        Log.e("ForegroundService", "One or more enabled tests failed.")
+                    } else {
+                        testSuccess = true
+                    }
+
+                    testDbHelper.insertTestResult(timestamp, location?.latitude, location?.longitude, testResults)
+                    broadcastConfigurationUpdate()
+                } catch (e: Exception) {
+                    Log.e("ForegroundService", "Failed to get last known location for test or test failed: ${e.message}")
+                    testSuccess = false
+                    broadcastConfigurationUpdate()
+                }
+                delay(configurationManager.getTestInterval().toLong())
+            }
+        }
+    }
+
+    /**
+     * Server synchronization routine to upload unsent data.
+     * Cancels any existing job before starting a new one.
      */
     private fun startServerSyncRoutine() {
-        serverSyncTimer?.cancel()
-        serverSyncTimer = Timer()
-        val serverSyncTask = object : TimerTask() {
-            override fun run() {
-                serviceScope.launch(Dispatchers.IO) {
+        serverSyncJob?.cancel()
+        serverSyncJob = serviceScope.launch {
+            while (isActive) {
+                try {
                     val deviceId = sessionManager.getSession().id
                     if (deviceId == null) {
-                        // Cannot upload without a device ID
-                        return@launch
+                        Log.e("ForegroundService", "Cannot upload data without a device ID.")
+                        serverSyncSuccess = false
+                        broadcastConfigurationUpdate()
+                        delay(configurationManager.getServerSyncInterval().toLong())
+                        continue
                     }
 
                     val (unsentCellRecords, cellIds) = dbHelper.getUnsentRecords()
                     val (unsentTestRecords, testIds) = testDbHelper.getUnsentRecords()
 
-                    if (unsentCellRecords.isEmpty() && unsentTestRecords.isEmpty()) {
-                        return@launch
-                    }
+                    if (unsentCellRecords.isNotEmpty() || unsentTestRecords.isNotEmpty()) {
+                        val mainJsonObject = JSONObject()
+                        val cellArray = JSONArray()
+                        unsentCellRecords.forEach { record ->
+                            record.put("deviceId", deviceId)
+                            record.put("latitude", record.getDouble("latitude"))
+                            record.put("longitude", record.getDouble("longitude"))
+                            cellArray.put(record)
+                        }
+                        mainJsonObject.put("cell_measurements", cellArray)
 
-                    val mainJsonObject = JSONObject()
-                    val cellArray = JSONArray()
-                    unsentCellRecords.forEach { record ->
-                        // Add deviceId and location to the cell measurement record
-                        record.put("deviceId", deviceId)
-                        record.put("latitude", record.getDouble("latitude")) // Ensure location is included
-                        record.put("longitude", record.getDouble("longitude"))
-                        cellArray.put(record)
-                    }
-                    mainJsonObject.put("cell_measurements", cellArray)
+                        val testArray = JSONArray()
+                        unsentTestRecords.forEach { record ->
+                            record.put("deviceId", deviceId)
+                            record.put("latitude", record.getDouble("latitude"))
+                            record.put("longitude", record.getDouble("longitude"))
+                            testArray.put(record)
+                        }
+                        mainJsonObject.put("test_results", testArray)
 
-                    val testArray = JSONArray()
-                    unsentTestRecords.forEach { record ->
-                        // Add deviceId and location to the test result record
-                        record.put("deviceId", deviceId)
-                        // You might need to add latitude and longitude to the TestResultDatabaseHelper
-                        // if it doesn't already store it. Assuming it does, you can retrieve it here.
-                        // For now, this is a placeholder.
-                        record.put("latitude", record.getDouble("latitude")) // Placeholder
-                        record.put("longitude", record.getDouble("longitude")) // Placeholder
-                        testArray.put(record)
-                    }
-                    mainJsonObject.put("test_results", testArray)
-
-                    val urlString = ConfigurationManager.getServerURL() + "/data/android/upload/"
-                    try {
-                        val url = URL(urlString)
-                        (url.openConnection() as HttpURLConnection).run {
+                        val urlString = ConfigurationManager.getServerURL() + "/data/android/upload/"
+                        (URL(urlString).openConnection() as HttpURLConnection).run {
                             requestMethod = "POST"
                             setRequestProperty("Content-Type", "application/json; charset=UTF-8")
                             doOutput = true
                             connectTimeout = 10000
                             readTimeout = 10000
-
                             val authToken = sessionManager.getSession().accessToken
                             if (authToken != null) {
                                 setRequestProperty("Authorization", "Bearer $authToken")
                             }
-
                             OutputStreamWriter(outputStream).use { it.write(mainJsonObject.toString()) }
-
-                            val responseCode = responseCode
                             if (responseCode == HttpURLConnection.HTTP_OK || responseCode == HttpURLConnection.HTTP_CREATED) {
-                                // Mark records as sent only if the upload was successful
                                 dbHelper.markRecordsAsSent(cellIds)
-                                testDbHelper.markRecordsAsSent(testIds)
+                                testDbHelper.deleteRecords(testIds)
+                                serverSyncSuccess = true
                             } else {
-                                // Handle the failed upload (e.g., log the error)
+                                Log.e("ForegroundService", "Upload failed with response code: $responseCode")
+                                serverSyncSuccess = false
                             }
                         }
-                    } catch (e: Exception) {
-                        e.printStackTrace()
+                    } else {
+                        // No data to upload, consider it a success for this cycle
+                        serverSyncSuccess = true
                     }
+                } catch (e: Exception) {
+                    Log.e("ForegroundService", "Error during server sync: ${e.message}")
+                    serverSyncSuccess = false
                 }
+                broadcastConfigurationUpdate()
+                delay(configurationManager.getServerSyncInterval().toLong())
             }
         }
-        serverSyncTimer?.schedule(serverSyncTask, 0, configurationManager.getServerSyncInterval())
+    }
+
+    private fun broadcastConfigurationUpdate() {
+        val updateIntent = Intent(ACTION_UPDATE_UI).apply {
+            putExtra("syncInterval", configurationManager.getServerSyncInterval().toLong())
+            putExtra("measurementInterval", configurationManager.getMeasurementInterval().toLong())
+            putExtra("testInterval", configurationManager.getTestInterval().toLong())
+            putExtra("pollingSuccess", pollingSuccess)
+            putExtra("serverSyncSuccess", serverSyncSuccess)
+            putExtra("cellMeasurementSuccess", cellMeasurementSuccess)
+            putExtra("testSuccess", testSuccess)
+        }
+        LocalBroadcastManager.getInstance(this).sendBroadcast(updateIntent)
     }
 }

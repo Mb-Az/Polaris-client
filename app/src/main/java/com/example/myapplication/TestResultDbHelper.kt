@@ -1,6 +1,4 @@
 // In TestResultDatabaseHelper.kt
-import CellInfoDatabaseHelper.Companion.COLUMN_LATITUDE
-import CellInfoDatabaseHelper.Companion.COLUMN_LONGITUDE
 import android.content.ContentValues
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
@@ -97,8 +95,8 @@ class TestResultDatabaseHelper(context: Context) :
                 val timestamp = it.getString(it.getColumnIndexOrThrow(COLUMN_TIMESTAMP))
                 val jsonObject = JSONObject().apply {
                     put("time", formatTimestamp(timestamp))
-                    put("latitude", it.getLong(it.getColumnIndexOrThrow(COLUMN_LATITUDE)))
-                    put("longitude", it.getLong(it.getColumnIndexOrThrow(COLUMN_LONGITUDE)))
+                    put("latitude", it.getDouble(it.getColumnIndexOrThrow(COLUMN_LATITUDE)))
+                    put("longitude", it.getDouble(it.getColumnIndexOrThrow(COLUMN_LONGITUDE)))
                     put("ping", it.getInt(it.getColumnIndexOrThrow(COLUMN_PING)))
                     put("dns", it.getInt(it.getColumnIndexOrThrow(COLUMN_DNS)))
                     put("throughput", it.getInt(it.getColumnIndexOrThrow(COLUMN_THROUGHPUT)))
@@ -114,11 +112,11 @@ class TestResultDatabaseHelper(context: Context) :
     /**
      * Marks a list of records as sent.
      */
-    fun markRecordsAsSent(ids: List<Int>) {
+    fun deleteRecords(ids: List<Int>) {
         if (ids.isEmpty()) return
         val db = writableDatabase
         val idList = ids.joinToString(",")
-        db.execSQL("UPDATE $TABLE_NAME SET $COLUMN_SENT = 1 WHERE $COLUMN_ID IN ($idList)")
+        db.execSQL("DELETE FROM $TABLE_NAME WHERE $COLUMN_ID IN ($idList)")
     }
 
     private fun formatTimestamp(timestamp: String): String {

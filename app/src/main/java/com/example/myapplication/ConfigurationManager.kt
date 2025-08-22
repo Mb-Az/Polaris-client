@@ -14,7 +14,7 @@ class ConfigurationManager(private val context: Context) {
 
     companion object {
         private const val SERVER_URL = "https://polaris-back.liara.run"
-        private const val SMS_PHONE_NUMBER = "09186988776"
+        private const val SMS_PHONE_NUMBER_KEY = "smsPhoneNumber"
         private const val SMS_TEXT = "Hello! This is a Message for SMS test!"
         private const val THROUGHPUT_URL = "https://www.google.com"
         private const val DNS_RESOLVE_DOMAIN = "www.digikala.com"
@@ -43,14 +43,11 @@ class ConfigurationManager(private val context: Context) {
         private const val DEFAULT_WEB_INCLUDED = true
         private const val DEFAULT_DNS_INCLUDED = true
         private const val DEFAULT_SMS_INCLUDED = true
+        private const val DEFAULT_SMS_PHONE_NUMBER = "+989186988776"
 
 
         public fun getServerURL() : String {
             return SERVER_URL
-        }
-
-        public fun getSMSPhoneNumber() : String {
-            return SMS_PHONE_NUMBER
         }
 
         public fun getSMSText() : String {
@@ -70,7 +67,7 @@ class ConfigurationManager(private val context: Context) {
         pollingInterval: Long?, measurementInterval: Long?, pingTestUrl: String?,
         webTestUrl: String?, serverSyncInterval: Long?, testInterval: Long?,
         throughputIncluded: Boolean?, pingIncluded: Boolean?, webIncluded: Boolean?,
-        dnsIncluded: Boolean?, smsIncluded: Boolean?
+        dnsIncluded: Boolean?, smsIncluded: Boolean?, smsPhoneNumber : String?
     ) {
         val sharedPreferences = context.getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         with(sharedPreferences.edit()) {
@@ -106,6 +103,9 @@ class ConfigurationManager(private val context: Context) {
 
             if(smsIncluded != null)
                 putBoolean(SMS_INCLUDED_KEY, smsIncluded)
+
+            if(smsPhoneNumber != null)
+                putString(SMS_PHONE_NUMBER_KEY, smsPhoneNumber)
 
             apply()
         }
@@ -166,6 +166,11 @@ class ConfigurationManager(private val context: Context) {
         return sharedPreferences.getBoolean(SMS_INCLUDED_KEY, DEFAULT_SMS_INCLUDED)
     }
 
+    public fun getSMSPhoneNumber() : String? {
+        val sharedPreferences = context.getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        return sharedPreferences.getString(SMS_PHONE_NUMBER_KEY, DEFAULT_SMS_PHONE_NUMBER)
+    }
+
     suspend fun fetchConfigurationFromServer(){
         return withContext(Dispatchers.IO) {
             val urlString = ConfigurationManager.getServerURL() + "/config/get/" // Set the correct API endpoint
@@ -196,12 +201,12 @@ class ConfigurationManager(private val context: Context) {
                         val newWebTestUrl = jsonObject.getString("web_url")
                         // Note: The API response format doesn't provide sms_phone_number or throughput_url,
                         // so those will continue to use the hardcoded values.
-                        throw Exception()
                         val newThroughputIncluded = jsonObject.getBoolean("throughput_included")
                         val newPingIncluded = jsonObject.getBoolean("ping_included")
                         val newWebIncluded = jsonObject.getBoolean("web_included")
                         val newDnsIncluded = jsonObject.getBoolean("dns_included")
                         val newSmsIncluded = jsonObject.getBoolean("sms_included")
+                        val newSmsPhoneNumber = jsonObject.getString("sms_phone_number")
 
                         saveNewConfiguration(
                             newPollingIntervalMillis,
@@ -214,7 +219,8 @@ class ConfigurationManager(private val context: Context) {
                             newPingIncluded,
                             newWebIncluded,
                             newDnsIncluded,
-                            newSmsIncluded
+                            newSmsIncluded,
+                            newSmsPhoneNumber
                         )
 
                     } else {
